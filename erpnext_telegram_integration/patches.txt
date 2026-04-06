@@ -1,0 +1,2 @@
+erpnext_telegram_integration.patches.v2_0.remove_telegram_and_date_doctypes
+erpnext_telegram_integration.patches.v2_0.rename_module_to_sms_notifications

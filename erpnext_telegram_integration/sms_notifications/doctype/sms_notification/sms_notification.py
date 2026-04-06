@@ -6,8 +6,6 @@ import frappe
 import json, os
 from frappe import _
 from frappe.model.document import Document
-
-# from frappe.core.doctype.role.role import get_emails_from_role
 from frappe.utils import (
     validate_email_address,
     nowdate,
@@ -17,13 +15,14 @@ from frappe.utils import (
 )
 from frappe.utils.jinja import validate_template
 from frappe.modules.utils import export_module_json, get_doc_module
-from six import string_types
-from erpnext_telegram_integration.erpnext_telegram_integration.doctype.telegram_settings.telegram_settings import (
-    send_to_telegram,
+from frappe.core.doctype.sms_settings.sms_settings import send_sms
+from frappe.contacts.doctype.contact.contact import (
+    get_default_contact,
+    get_contact_details,
 )
 
 
-class TelegramNotification(Document):
+class SMSNotification(Document):
     def onload(self):
         """load message"""
         if self.is_standard:
@@ -36,6 +35,8 @@ class TelegramNotification(Document):
     def validate(self):
         validate_template(self.subject)
         validate_template(self.message)
+        if not validate_sms_settings():
+            frappe.msgprint(_("Please setup SMS Settings"))
 
         if self.event in ("Days Before", "Days After") and not self.date_changed:
             frappe.throw(_("Please specify which date field must be checked"))
@@ -46,7 +47,7 @@ class TelegramNotification(Document):
         self.validate_forbidden_types()
         self.validate_condition()
         self.validate_standard()
-        frappe.cache().hdel("tel_notifications", self.document_type)
+        frappe.cache().hdel("sms_notifications", self.document_type)
 
     def on_update(self):
         path = export_module_json(self, self.is_standard, self.module)
@@ -62,12 +63,12 @@ class TelegramNotification(Document):
                     f.write(
                         """from __future__ import unicode_literals
 
-import frappe
+							import frappe
 
-def get_context(context):
-	# do your magic here
-	pass
-"""
+							def get_context(context):
+								# do your magic here
+								pass
+							"""
                     )
 
     def validate_standard(self):
@@ -82,7 +83,7 @@ def get_context(context):
         temp_doc = frappe.new_doc(self.document_type)
         if self.condition:
             try:
-                frappe.safe_eval(self.condition, None, get_context(temp_doc))
+                frappe.safe_eval(self.condition, None, get_context(temp_doc.as_dict()))
             except Exception:
                 frappe.throw(_("The Condition '{0}' is invalid").format(self.condition))
 
@@ -144,8 +145,8 @@ def get_context(context):
         if self.is_standard:
             self.load_standard_properties(context)
 
-        if self.channel == "Telegram":
-            self.send_a_telegram_msg(doc, context)
+        if self.channel == "SMS":
+            self.send_sms_msg(doc, context)
 
         if self.set_property_after_alert:
             allow_update = True
@@ -167,99 +168,51 @@ def get_context(context):
                 )
                 doc.set(self.set_property_after_alert, self.property_value)
 
+    def send_sms_msg(self, doc, context):
+        space = "\n"
+        message = frappe.render_template(self.subject, context) + space
+        message = message + frappe.render_template(self.message, context)
+        recipients_no_list = self.get_recipients_no_list()
+        recipients_no_list.extend(self.get_dynamic_recipients(doc))
+        if validate_sms_settings():
+            send_sms(
+                receiver_list=recipients_no_list,
+                msg=message,
+            )
+
     def get_dynamic_recipients(self, doc):
-        recipients_telegram_user_list = []
-        field_names = ["Customer", "Supplier", "Student", "Employee", "User"]
+        recipients_no_list = []
+        field_names = ["Customer", "Supplier", "Student", "Employee"]
         if self.dynamic_recipients:
             fields = get_doc_fields(self.document_type)
             for d in fields:
-                party = d.get("field_options")
-                if not party:
-                    if (
-                        d.get("field_get_value")
-                        and doc.get(d["field_get_value"]) in field_names
-                    ):
-                        party = doc.get(d["field_get_value"])
-                    else:
-                        break
-
-                filters = {
-                        "party": party,
-                        "telegram_user": doc.get(d["fieldname"]),
-                    }
-                telegram_user_list = frappe.get_all(
-                    "Telegram User Settings",
-                    filters=filters,
-                    fields=["name", "telegram_settings", "telegram_user"],
-                )
-                for i in telegram_user_list:
-                    recipients_telegram_user_list.append(i.name)
-        return recipients_telegram_user_list
-
-    def send_a_telegram_msg(self, doc, context):
-        recipients_telegram_user_list = []
-        if self.telegram_user:
-            recipients_telegram_user_list.append(self.telegram_user)
-        recipients_telegram_user_list.extend(self.get_dynamic_recipients(doc))
-        space = "\n" * 2
-        message = frappe.render_template(self.subject, context) + space
-        message = message + frappe.render_template(self.message, context)
-        attachment = self.get_attachment(doc)
-        for telegram_user in recipients_telegram_user_list:
-            send_to_telegram(
-                telegram_user=telegram_user,
-                message=message,
-                reference_doctype=doc.doctype,
-                reference_name=doc.name,
-                attachment=attachment,
-            )
-
-            doc.message_notification = message
-            doc.from_user = frappe.session.user
-            doc.party_type = frappe.get_value(
-                "Telegram User Settings", telegram_user, "party"
-            )
-            doc.to_party = frappe.get_value(
-                "Telegram User Settings", telegram_user, "telegram_user"
-            )
-            creat_extra_notification_log(doc)
-
-    def get_attachment(self, doc):
-        """ check print settings are attach the pdf """
-        if not self.attach_print:
-            return None
-
-        print_settings = frappe.get_doc("Print Settings", "Print Settings")
-        if (doc.docstatus == 0 and not print_settings.allow_print_for_draft) or (
-            doc.docstatus == 2 and not print_settings.allow_print_for_cancelled
-        ):
-
-            # ignoring attachment as draft and cancelled documents are not allowed to print
-            status = "Draft" if doc.docstatus == 0 else "Cancelled"
-            frappe.throw(
-                _(
-                    """Not allowed to attach {0} document,
-				please enable Allow Print For {0} in Print Settings""".format(
-                        status
+                if doc.get(d["fieldname"]):
+                    party = d.get("field_options")
+                    if not party:
+                        if (
+                            d.get("field_get_value")
+                            and doc.get(d["field_get_value"]) in field_names
+                        ):
+                            party = doc.get(d["field_get_value"])
+                        else:
+                            break
+                    default_contact = get_default_contact(
+                        party, doc.get(d["fieldname"])
                     )
-                ),
-                title=_("Error in Notification"),
-            )
-        else:
-            return [
-                {
-                    "print_format_attachment": 1,
-                    "doctype": doc.doctype,
-                    "name": doc.name,
-                    "print_format": self.print_format,
-                    "print_letterhead": print_settings.with_letterhead,
-                    "lang": frappe.db.get_value(
-                        "Print Format", self.print_format, "default_print_language"
-                    )
-                    if self.print_format
-                    else "en",
-                }
-            ]
+                    contact_details = get_contact_details(default_contact)
+                    if contact_details.get("contact_mobile"):
+                        recipients_no_list.append(contact_details.get("contact_mobile"))
+
+        return recipients_no_list
+
+    def get_recipients_no_list(self):
+        if not self.recipients:
+            return []
+        recipients_no_list = []
+        for contact in self.recipients:
+            if contact.mobile_no:
+                recipients_no_list.append(contact.mobile_no)
+        return recipients_no_list
 
     def get_template(self):
         module = get_doc_module(self.module, self.doctype, self.name)
@@ -292,33 +245,50 @@ def get_context(context):
 
 
 @frappe.whitelist()
-def run_telegram_notifications(doc, method):
+def run_sms_notifications(doc, method):
+	alerts = frappe.cache().hget("sms_notifications", doc.doctype)
+	if alerts is None:
+		alerts = frappe.get_all(
+			"SMS Notification",
+			fields=["name", "event", "method"],
+			filters={"enabled": 1, "document_type": doc.doctype},
+		)
+		frappe.cache().hset("sms_notifications", doc.doctype, alerts)
+	if not alerts:
+		return
+	frappe.enqueue(
+		"erpnext_telegram_integration.sms_notifications.doctype.sms_notification.sms_notification.run_sms_notifications_in_background",
+		doc=doc,
+		method1=method,
+	)
+
+def run_sms_notifications_in_background(doc, method1):
+    method=method1
     """Run notifications for this method"""
     if frappe.flags.in_import or frappe.flags.in_patch or frappe.flags.in_install:
         return
 
-    if doc.flags.tel_notifications_executed == None:
-        doc.flags.tel_notifications_executed = []
+    if doc.flags.sms_notifications_executed == None:
+        doc.flags.sms_notifications_executed = []
 
-    if doc.flags.tel_notifications == None:
-        alerts = frappe.cache().hget("tel_notifications", doc.doctype)
+    if doc.flags.sms_notifications == None:
+        alerts = frappe.cache().hget("sms_notifications", doc.doctype)
         if alerts == None:
             alerts = frappe.get_all(
-                "Telegram Notification",
+                "SMS Notification",
                 fields=["name", "event", "method"],
                 filters={"enabled": 1, "document_type": doc.doctype},
             )
-            frappe.cache().hset("tel_notifications", doc.doctype, alerts)
-        doc.flags.tel_notifications = alerts
+            frappe.cache().hset("sms_notifications", doc.doctype, alerts)
+        doc.flags.sms_notifications = alerts
 
-    if not doc.flags.tel_notifications:
+    if not doc.flags.sms_notifications:
         return
 
     def _evaluate_alert(alert):
-        if not alert.name in doc.flags.tel_notifications_executed:
-            if frappe.db.exists("Telegram Notification", alert.name):
-               evaluate_alert(doc, alert.name, alert.event)
-               doc.flags.tel_notifications_executed.append(alert.name)
+        if not alert.name in doc.flags.sms_notifications_executed:
+            evaluate_alert(doc, alert.name, alert.event)
+            doc.flags.sms_notifications_executed.append(alert.name)
 
     event_map = {
         "on_update": "Save",
@@ -333,7 +303,7 @@ def run_telegram_notifications(doc, method):
         event_map["before_change"] = "Value Change"
         event_map["before_update_after_submit"] = "Value Change"
 
-    for alert in doc.flags.tel_notifications:
+    for alert in doc.flags.sms_notifications:
         event = event_map.get(method, None)
         if event and alert.event == event:
             _evaluate_alert(alert)
@@ -343,7 +313,7 @@ def run_telegram_notifications(doc, method):
 
 @frappe.whitelist()
 def get_documents_for_today(notification):
-    notification = frappe.get_doc("Telegram Notification", notification)
+    notification = frappe.get_doc("SMS Notification", notification)
     notification.check_permission("read")
     return [d.name for d in notification.get_documents_for_today()]
 
@@ -359,11 +329,11 @@ def trigger_notifications(doc, method=None):
 
     if method == "daily":
         doc_list = frappe.get_all(
-            "Telegram Notification",
+            "SMS Notification",
             filters={"event": ("in", ("Days Before", "Days After")), "enabled": 1},
         )
         for d in doc_list:
-            alert = frappe.get_doc("Telegram Notification", d.name)
+            alert = frappe.get_doc("SMS Notification", d.name)
 
             for doc in alert.get_documents_for_today():
                 evaluate_alert(doc, alert, alert.event)
@@ -374,8 +344,8 @@ def evaluate_alert(doc, alert, event):
     from jinja2 import TemplateError
 
     try:
-        if isinstance(alert, string_types):
-            alert = frappe.get_doc("Telegram Notification", alert)
+        if isinstance(alert, str):
+            alert = frappe.get_doc("SMS Notification", alert)
 
         context = get_context(doc)
 
@@ -434,7 +404,7 @@ def get_context(doc):
 def get_doc_fields(doctype_name):
     fields = frappe.get_meta(doctype_name).fields
     filed_list = []
-    field_names = ["Customer", "Supplier", "Student", "Employee", "User"]
+    field_names = ["Customer", "Supplier", "Student", "Employee"]
     for d in fields:
         if d.fieldtype == "Link" and d.options in field_names:
             field = {
@@ -461,17 +431,9 @@ def get_doc_fields(doctype_name):
     return filed_list
 
 
-def creat_extra_notification_log(doc):
-    enl_doc = frappe.new_doc("Extra Notification Log")
-    enl_doc.subject = _(doc.doctype) + " " + _(doc.name)
-    enl_doc.doctype_name = doc.doctype
-    enl_doc.doc_name = doc.name
-    enl_doc.status = "Closed"
-    enl_doc.type = "Telegram"
-    enl_doc.doc_name = doc.name
-    enl_doc.message = _(doc.message_notification)
-    enl_doc.party_type = doc.party_type
-    enl_doc.to_party = doc.to_party
-    enl_doc.from_user = doc.from_user
-
-    enl_doc.insert(ignore_permissions=True)
+def validate_sms_settings():
+    sms_setting = frappe.get_single("SMS Settings")
+    if sms_setting.sms_gateway_url:
+        return True
+    else:
+        return False
